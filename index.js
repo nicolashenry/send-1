@@ -70,74 +70,87 @@ async function send (ctx, path, opts = {}) {
   // hidden file support, ignore
   if (!hidden && isHidden(root, path)) return
 
-  let encodingExt = ''
-  // serve brotli file when possible otherwise gzipped file when possible
-  if (ctx.acceptsEncodings('br', 'identity') === 'br' && brotli && (await fs.exists(path + '.br'))) {
-    path = path + '.br'
-    ctx.set('Content-Encoding', 'br')
-    ctx.res.removeHeader('Content-Length')
-    encodingExt = '.br'
-  } else if (ctx.acceptsEncodings('gzip', 'identity') === 'gzip' && gzip && (await fs.exists(path + '.gz'))) {
-    path = path + '.gz'
-    ctx.set('Content-Encoding', 'gzip')
-    ctx.res.removeHeader('Content-Length')
-    encodingExt = '.gz'
-  }
-
-  if (extensions && extname(path) === '') {
-    const list = [].concat(extensions)
-    for (let i = 0; i < list.length; i++) {
-      let ext = list[i]
-      if (typeof ext !== 'string') {
-        throw new TypeError('option extensions must be array of strings or false')
-      }
-      if (!/^\./.exec(ext)) ext = '.' + ext
-      if (await fs.exists(path + ext)) {
-        path = path + ext
-        break
-      }
-    }
-  }
-
-  // stat
-  let stats
+  let fd
   try {
-    stats = await fs.stat(path)
-
-    // Format the path to serve static file servers
-    // and not require a trailing slash for directories,
-    // so that you can do both `/directory` and `/directory/`
-    if (stats.isDirectory()) {
-      if (format && index) {
-        path += sep + index
-        stats = await fs.stat(path)
-      } else {
-        return
+    let encodingExt = ''
+    // serve brotli file when possible otherwise gzipped file when possible
+    if (ctx.acceptsEncodings('br', 'identity') === 'br' && brotli && (fd = await safeOpen(path + '.br'))) {
+      path = path + '.br'
+      ctx.set('Content-Encoding', 'br')
+      ctx.res.removeHeader('Content-Length')
+      encodingExt = '.br'
+    } else if (ctx.acceptsEncodings('gzip', 'identity') === 'gzip' && gzip && (fd = await safeOpen(path + '.gz'))) {
+      path = path + '.gz'
+      ctx.set('Content-Encoding', 'gzip')
+      ctx.res.removeHeader('Content-Length')
+      encodingExt = '.gz'
+    } else if (extensions && extname(path) === '') {
+      const list = [].concat(extensions)
+      for (let i = 0; i < list.length; i++) {
+        let ext = list[i]
+        if (typeof ext !== 'string') {
+          throw new TypeError('option extensions must be array of strings or false')
+        }
+        if (!/^\./.exec(ext)) ext = '.' + ext
+        fd = await safeOpen(path + ext)
+        if (fd) {
+          path = path + ext
+          break
+        }
       }
     }
-  } catch (err) {
-    const notfound = ['ENOENT', 'ENAMETOOLONG', 'ENOTDIR']
-    if (notfound.includes(err.code)) {
-      throw createError(404, err)
+
+    // stat
+    let stats
+    try {
+      if (!fd) {
+        fd = await fs.open(path, fs.constants.O_RDONLY)
+      }
+      stats = await fs.fstat(fd)
+
+      // Format the path to serve static file servers
+      // and not require a trailing slash for directories,
+      // so that you can do both `/directory` and `/directory/`
+      if (stats.isDirectory()) {
+        fs.close(fd)
+        fd = undefined
+        if (format && index) {
+          path += sep + index
+          fd = await fs.open(path, fs.constants.O_RDONLY)
+          stats = await fs.fstat(fd)
+        } else {
+          return
+        }
+      }
+    } catch (err) {
+      const notfound = ['ENOENT', 'ENAMETOOLONG', 'ENOTDIR']
+      if (notfound.includes(err.code)) {
+        throw createError(404, err)
+      }
+      err.status = 500
+      throw err
     }
-    err.status = 500
+
+    if (setHeaders) setHeaders(ctx.res, path, stats)
+
+    // stream
+    ctx.set('Content-Length', stats.size)
+    if (!ctx.response.get('Last-Modified')) ctx.set('Last-Modified', stats.mtime.toUTCString())
+    if (!ctx.response.get('Cache-Control')) {
+      const directives = ['max-age=' + (maxage / 1000 | 0)]
+      if (immutable) {
+        directives.push('immutable')
+      }
+      ctx.set('Cache-Control', directives.join(','))
+    }
+    if (!ctx.type) ctx.type = type(path, encodingExt)
+  } catch (err) {
+    if (fd) {
+      fs.close(fd)
+    }
     throw err
   }
-
-  if (setHeaders) setHeaders(ctx.res, path, stats)
-
-  // stream
-  ctx.set('Content-Length', stats.size)
-  if (!ctx.response.get('Last-Modified')) ctx.set('Last-Modified', stats.mtime.toUTCString())
-  if (!ctx.response.get('Cache-Control')) {
-    const directives = ['max-age=' + (maxage / 1000 | 0)]
-    if (immutable) {
-      directives.push('immutable')
-    }
-    ctx.set('Cache-Control', directives.join(','))
-  }
-  if (!ctx.type) ctx.type = type(path, encodingExt)
-  ctx.body = fs.createReadStream(path)
+  ctx.body = fs.createReadStream(path, { fd })
 
   return path
 }
@@ -172,4 +185,19 @@ function decode (path) {
   } catch (err) {
     return -1
   }
+}
+
+/**
+ * Open file, return undefined if does not exist
+ */
+async function safeOpen (path) {
+  let fd
+  try {
+    fd = await fs.open(path, fs.constants.O_RDONLY)
+  } catch (err) {
+    if (err.code !== 'ENOENT') {
+      throw err
+    }
+  }
+  return fd
 }
